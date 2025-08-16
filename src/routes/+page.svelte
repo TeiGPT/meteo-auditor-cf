@@ -4,7 +4,7 @@
 	let lon = '';
 	let data_inicio = '2025-05-02';
 	let data_fim = '2025-05-10';
-	// 👇 só daily ou hourly; default: daily
+	// só estas duas opções:
 	let resolucao = 'daily';
 
 	let resultado: any = null;
@@ -149,4 +149,3 @@
 	.hint { margin-bottom: 1rem; color: #0369a1; }
 	pre { background: #1e293b; color: #e2e8f0; padding: 1rem; border-radius: 6px; overflow-x: auto; font-size: 0.9rem; line-height: 1.5; }
 </style>
-
