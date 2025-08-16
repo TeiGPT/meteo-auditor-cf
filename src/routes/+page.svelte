@@ -4,31 +4,13 @@
 	let lon = '';
 	let data_inicio = '2025-05-02';
 	let data_fim = '2025-05-10';
-
-	// Só estas duas resoluções
-	type Resolucao = 'daily' | 'hourly';
-	let resolucao: Resolucao = 'hourly';
+	// 👇 só daily ou hourly; default: daily
+	let resolucao = 'daily';
 
 	let resultado: any = null;
 	let loading = false;
 	let error = '';
 	let reportUrlHeader: string | null = null;
-
-	function buildParams(forDocx = false) {
-		const p = new URLSearchParams({ data_inicio, data_fim });
-
-		// Para a API /api/analisar usamos SEMPRE hourly para evitar falhas de origem
-		// Para o DOCX usamos a resolução real (daily/hourly)
-		const res = forDocx ? resolucao : ('hourly' as Resolucao);
-		p.set('resolucao', res);
-
-		if (local) p.set('local', local);
-		else {
-			p.set('lat', lat);
-			p.set('lon', lon);
-		}
-		return p;
-	}
 
 	async function analisar() {
 		loading = true;
@@ -36,7 +18,13 @@
 		resultado = null;
 
 		try {
-			const response = await fetch(`/api/analisar?${buildParams(false)}`);
+			const params = new URLSearchParams({ data_inicio, data_fim, resolucao });
+			if (local) params.set('local', local);
+			else {
+				params.set('lat', lat);
+				params.set('lon', lon);
+			}
+			const response = await fetch(`/api/analisar?${params}`);
 			const data = await response.json();
 			if (response.ok) {
 				resultado = data;
@@ -52,7 +40,13 @@
 
 	async function exportarDocx() {
 		try {
-			const res = await fetch(`/api/analisar.docx?${buildParams(true)}`);
+			const params = new URLSearchParams({ data_inicio, data_fim, resolucao });
+			if (local) params.set('local', local);
+			else {
+				params.set('lat', lat);
+				params.set('lon', lon);
+			}
+			const res = await fetch(`/api/analisar.docx?${params}`);
 			reportUrlHeader = res.headers.get('X-Report-URL');
 			if (!res.ok) {
 				const t = await res.text();
@@ -86,10 +80,12 @@
 			<label for="local">Local:</label>
 			<input id="local" type="text" bind:value={local} placeholder="Cidade/freguesia em Portugal, ex.: Espinho" />
 		</div>
+
 		<div class="form-group">
 			<label for="data_inicio">Data de Início:</label>
 			<input id="data_inicio" type="date" bind:value={data_inicio} required />
 		</div>
+
 		<div class="form-group">
 			<label for="data_fim">Data de Fim:</label>
 			<input id="data_fim" type="date" bind:value={data_fim} required />
@@ -122,8 +118,7 @@
 			<h3>Resultado da Análise:</h3>
 			{#if resultado.place}
 				<div>
-					Resolvido: {resultado.place.name} ({resultado.place.lat}, {resultado.place.lon})
-					— distrito {resultado.place.admin1 || '—'} — ICAO {resultado.icao || '—'}
+					Resolvido: {resultado.place.name} ({resultado.place.lat}, {resultado.place.lon}) — distrito {resultado.place.admin1 || '—'} — ICAO {resultado.icao || '—'}
 				</div>
 			{/if}
 			{#if resultado.series && resultado.series.length > 0}
