@@ -4,11 +4,17 @@
 	let lon = '';
 	let data_inicio = '2025-05-02';
 	let data_fim = '2025-05-10';
-	let resolucao = 'hourly';
+	let resolucao: 'daily' | 'hourly' = 'hourly';
 	let resultado: any = null;
 	let loading = false;
 	let error = '';
 	let reportUrlHeader: string | null = null;
+
+	function effectiveRes(r: string) {
+		// A API interna só entende hourly/10min; quando pedires "daily"
+		// enviamos hourly e deixamos a agregação para o relatório.
+		return r === 'daily' ? 'hourly' : r;
+	}
 
 	async function analisar() {
 		loading = true;
@@ -16,9 +22,17 @@
 		resultado = null;
 
 		try {
-			const params = new URLSearchParams({ data_inicio, data_fim, resolucao });
+			const params = new URLSearchParams({
+				data_inicio,
+				data_fim,
+				resolucao: effectiveRes(resolucao) // NUNCA mandar "daily" para a API
+			});
 			if (local) params.set('local', local);
 			else { params.set('lat', lat); params.set('lon', lon); }
+
+			// passamos o modo desejado só como “hint”; o servidor pode ignorar
+			params.set('agg', resolucao);
+
 			const response = await fetch(`/api/analisar?${params}`);
 			const data = await response.json();
 			if (response.ok) {
@@ -35,9 +49,16 @@
 
 	async function exportarDocx() {
 		try {
-			const params = new URLSearchParams({ data_inicio, data_fim, resolucao });
+			const params = new URLSearchParams({
+				data_inicio,
+				data_fim,
+				resolucao: effectiveRes(resolucao) // idem
+			});
 			if (local) params.set('local', local);
 			else { params.set('lat', lat); params.set('lon', lon); }
+			// dizemos ao servidor qual tabela queremos no DOCX
+			params.set('agg', resolucao);
+
 			const res = await fetch(`/api/analisar.docx?${params}`);
 			reportUrlHeader = res.headers.get('X-Report-URL');
 			if (!res.ok) {
@@ -83,8 +104,8 @@
 		<div class="form-group">
 			<label for="resolucao">Resolução:</label>
 			<select id="resolucao" bind:value={resolucao} required>
+				<option value="daily">Daily</option>
 				<option value="hourly">Hourly</option>
-				<option value="10min">10 minutos</option>
 			</select>
 		</div>
 		<div class="btn-row">

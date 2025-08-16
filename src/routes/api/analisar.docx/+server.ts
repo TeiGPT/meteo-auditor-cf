@@ -7,35 +7,35 @@ function required(url: URL, key: string): string {
 	return v;
 }
 
-export const GET: RequestHandler = async ({ url, fetch, locals, platform }) => {
+export const GET: RequestHandler = async ({ url, fetch, platform }) => {
 	try {
 		const localQ = url.searchParams.get('local');
 		const lat = url.searchParams.get('lat');
 		const lon = url.searchParams.get('lon');
 		const data_inicio = required(url, 'data_inicio');
 		const data_fim = required(url, 'data_fim');
-		const resolucao = required(url, 'resolucao');
+		const resolucaoReq = required(url, 'resolucao'); // pode ser 'daily' ou 'hourly'
+		const agg = (url.searchParams.get('agg') as 'daily' | 'hourly' | null) ?? (resolucaoReq === 'daily' ? 'daily' : 'hourly');
+
+		// Para a API interna usamos sempre hourly quando pedirem daily
+		const resForApi = resolucaoReq === 'daily' ? 'hourly' : resolucaoReq;
 
 		const apiUrl = new URL('/api/analisar', url);
-		if (localQ) {
-			apiUrl.searchParams.set('local', localQ);
-		} else {
+		if (localQ) apiUrl.searchParams.set('local', localQ);
+		else {
 			if (!lat || !lon) throw new Error('Missing local or lat/lon');
 			apiUrl.searchParams.set('lat', lat);
 			apiUrl.searchParams.set('lon', lon);
 		}
 		apiUrl.searchParams.set('data_inicio', data_inicio);
 		apiUrl.searchParams.set('data_fim', data_fim);
-		apiUrl.searchParams.set('resolucao', resolucao);
+		apiUrl.searchParams.set('resolucao', resForApi);
 
 		const analysisRes = await fetch(apiUrl.toString());
-		if (!analysisRes.ok) {
-			return new Response(await analysisRes.text(), { status: analysisRes.status });
-		}
+		if (!analysisRes.ok) return new Response(await analysisRes.text(), { status: analysisRes.status });
+
 		const analysis = await analysisRes.json();
-		if (!analysis?.ok) {
-			return new Response(JSON.stringify(analysis), { status: 500 });
-		}
+		if (!analysis?.ok) return new Response(JSON.stringify(analysis), { status: 500 });
 
 		const startISO = `${data_inicio}T00:00:00Z`;
 		const endISO = `${data_fim}T23:00:00Z`;
@@ -43,12 +43,14 @@ export const GET: RequestHandler = async ({ url, fetch, locals, platform }) => {
 		const resolvedLat = lat ? Number(lat) : Number(analysis?.place?.lat ?? 0);
 		const resolvedLon = lon ? Number(lon) : Number(analysis?.place?.lon ?? 0);
 		const resolvedLabel = analysis?.place?.name ? `${analysis.place.name} — ${analysis.place.admin1 || ''}`.trim() : undefined;
+
 		const { arrayBuffer } = await buildReport({
 			local: { lat: resolvedLat, lon: resolvedLon, label: resolvedLabel },
 			period: { startISO, endISO, tz: 'Europe/Lisbon' },
 			series: analysis.series,
 			warnings: analysis.warnings ?? [],
-			sources_links: analysis.sources_links ?? {}
+			sources_links: analysis.sources_links ?? {},
+			mode: agg // <<< daily ou hourly para o DOCX
 		});
 
 		const yyyymmdd = (s: string) => s.slice(0, 10).replaceAll('-', '');
@@ -60,13 +62,10 @@ export const GET: RequestHandler = async ({ url, fetch, locals, platform }) => {
 			'X-Report-Source': 'edge'
 		};
 
-		// Optional R2 upload if available
 		const r2: any = (platform as any)?.env?.R2_REPORTS;
 		if (r2 && typeof r2.put === 'function') {
-			const key = `reports/relatorio-meteo-${lat}-${lon}-${data_inicio}-${data_fim}.docx`;
-			await r2.put(key, new Uint8Array(arrayBuffer), {
-				httpMetadata: { contentType: headers['Content-Type'] }
-			});
+			const key = `reports/relatorio-meteo-${resolvedLat}-${resolvedLon}-${data_inicio}-${data_fim}.docx`;
+			await r2.put(key, new Uint8Array(arrayBuffer), { httpMetadata: { contentType: headers['Content-Type'] } });
 			if (r2.publicUrl) headers['X-Report-URL'] = `${r2.publicUrl}/${key}`;
 		}
 
