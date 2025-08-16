@@ -5,13 +5,30 @@
 	let data_inicio = '2025-05-02';
 	let data_fim = '2025-05-10';
 
-	// ✅ Daily por defeito
-	let resolucao = 'daily';
+	// Só estas duas resoluções
+	type Resolucao = 'daily' | 'hourly';
+	let resolucao: Resolucao = 'hourly';
 
 	let resultado: any = null;
 	let loading = false;
 	let error = '';
 	let reportUrlHeader: string | null = null;
+
+	function buildParams(forDocx = false) {
+		const p = new URLSearchParams({ data_inicio, data_fim });
+
+		// Para a API /api/analisar usamos SEMPRE hourly para evitar falhas de origem
+		// Para o DOCX usamos a resolução real (daily/hourly)
+		const res = forDocx ? resolucao : ('hourly' as Resolucao);
+		p.set('resolucao', res);
+
+		if (local) p.set('local', local);
+		else {
+			p.set('lat', lat);
+			p.set('lon', lon);
+		}
+		return p;
+	}
 
 	async function analisar() {
 		loading = true;
@@ -19,10 +36,7 @@
 		resultado = null;
 
 		try {
-			const params = new URLSearchParams({ data_inicio, data_fim, resolucao });
-			if (local) params.set('local', local);
-			else { params.set('lat', lat); params.set('lon', lon); }
-			const response = await fetch(`/api/analisar?${params}`);
+			const response = await fetch(`/api/analisar?${buildParams(false)}`);
 			const data = await response.json();
 			if (response.ok) {
 				resultado = data;
@@ -38,10 +52,7 @@
 
 	async function exportarDocx() {
 		try {
-			const params = new URLSearchParams({ data_inicio, data_fim, resolucao });
-			if (local) params.set('local', local);
-			else { params.set('lat', lat); params.set('lon', lon); }
-			const res = await fetch(`/api/analisar.docx?${params}`);
+			const res = await fetch(`/api/analisar.docx?${buildParams(true)}`);
 			reportUrlHeader = res.headers.get('X-Report-URL');
 			if (!res.ok) {
 				const t = await res.text();
@@ -84,13 +95,11 @@
 			<input id="data_fim" type="date" bind:value={data_fim} required />
 		</div>
 
-		<!-- ✅ Mantemos o seletor, agora com "Daily" por defeito -->
 		<div class="form-group">
 			<label for="resolucao">Resolução:</label>
 			<select id="resolucao" bind:value={resolucao} required>
 				<option value="daily">Daily</option>
 				<option value="hourly">Hourly</option>
-				<option value="10min">10 minutos</option>
 			</select>
 		</div>
 
@@ -112,7 +121,10 @@
 		<div class="result">
 			<h3>Resultado da Análise:</h3>
 			{#if resultado.place}
-				<div>Resolvido: {resultado.place.name} ({resultado.place.lat}, {resultado.place.lon}) — distrito {resultado.place.admin1 || '—'} — ICAO {resultado.icao || '—'}</div>
+				<div>
+					Resolvido: {resultado.place.name} ({resultado.place.lat}, {resultado.place.lon})
+					— distrito {resultado.place.admin1 || '—'} — ICAO {resultado.icao || '—'}
+				</div>
 			{/if}
 			{#if resultado.series && resultado.series.length > 0}
 				{#if resultado.series.filter((s: any) => s.wind_kmh != null || s.gust_kmh != null || s.precip_mm != null).length < (resultado.series.length * 0.2)}

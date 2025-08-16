@@ -18,23 +18,49 @@ import {
   WidthType
 } from "docx";
 
-// Usa o helper de tempo que já tens no projecto
 import { toISOInTZ } from "../time";
 
 type SeriesItem = {
-  epoch: number; // segundos ou ms
+  epoch?: number; // segundos OU ms (opcional)
+  date?: string;  // "YYYY-MM-DD" (opcional)
+  time?: string;  // ISO (opcional)
+  datetime?: string; // ISO (opcional)
+
   wind_kmh?: number | null;
   gust_kmh?: number | null;
-  precip_mm?: number | null; // valor horario
-  thunder?: number | boolean | null; // opcional
+  precip_mm?: number | null; // valor horário (se vier diário pode já estar agregado)
+  thunder?: number | boolean | null; // nº de horas com trovoada (hourly) ou bandeira
 };
 
+// ---------- Helpers de tempo/dados ----------
+
 function msFromEpoch(e: number) {
+  // aceita epoch em segundos ou ms
   return e < 2e10 ? e * 1000 : e;
 }
 
+function dateFromItem(it: SeriesItem): Date | null {
+  if (it == null) return null;
+  if (typeof it.epoch === "number" && Number.isFinite(it.epoch)) {
+    return new Date(msFromEpoch(it.epoch));
+  }
+  if (typeof it.time === "string") {
+    const d = new Date(it.time);
+    if (!Number.isNaN(d.getTime())) return d;
+  }
+  if (typeof it.datetime === "string") {
+    const d = new Date(it.datetime);
+    if (!Number.isNaN(d.getTime())) return d;
+  }
+  if (typeof it.date === "string") {
+    const d = new Date(it.date + "T00:00:00");
+    if (!Number.isNaN(d.getTime())) return d;
+  }
+  return null;
+}
+
 function dayKey(d: Date, tz: string) {
-  // YYYY-MM-DD
+  // YYYY-MM-DD na timezone desejada
   const iso = toISOInTZ(d, tz);
   return iso.slice(0, 10);
 }
@@ -79,7 +105,9 @@ function linkPara(title: string, url: string) {
   });
 }
 
-// Agrega série HORÁRIA -> DIÁRIA
+// ---------- Agregações ----------
+
+// Agrega série HORÁRIA (ou mistura) -> DIÁRIA
 function aggregateDaily(items: SeriesItem[], tz: string, thunderDaily?: Record<string, number>) {
   type Acc = {
     windSum: number; windN: number;
@@ -90,9 +118,17 @@ function aggregateDaily(items: SeriesItem[], tz: string, thunderDaily?: Record<s
   const byDay = new Map<string, Acc>();
 
   for (const it of items || []) {
-    const d = new Date(msFromEpoch(it.epoch));
+    const d = dateFromItem(it);
+    if (!d || Number.isNaN(d.getTime())) continue;
+
     const day = dayKey(d, tz);
-    const acc = byDay.get(day) || { windSum: 0, windN: 0, gustMax: null, precipHourMax: null, thunderCount: 0 };
+    const acc = byDay.get(day) || {
+      windSum: 0, windN: 0,
+      gustMax: null,
+      precipHourMax: null,
+      thunderCount: 0
+    };
+
     if (it.wind_kmh != null && !Number.isNaN(it.wind_kmh)) {
       acc.windSum += it.wind_kmh;
       acc.windN += 1;
@@ -101,30 +137,28 @@ function aggregateDaily(items: SeriesItem[], tz: string, thunderDaily?: Record<s
       acc.gustMax = acc.gustMax == null ? it.gust_kmh : Math.max(acc.gustMax, it.gust_kmh);
     }
     if (it.precip_mm != null && !Number.isNaN(it.precip_mm)) {
+      // queremos o pico horário do dia
       acc.precipHourMax = acc.precipHourMax == null ? it.precip_mm : Math.max(acc.precipHourMax, it.precip_mm);
     }
-    if (it.thunder) acc.thunderCount += 1;
+    if (it.thunder) acc.thunderCount += Number(it.thunder) || 1;
+
     byDay.set(day, acc);
   }
 
-  const rows = Array.from(byDay.entries()).sort((a, b) => a[0].localeCompare(b[0])).map(([day, acc]) => {
-    const windAvg = acc.windN > 0 ? acc.windSum / acc.windN : null;
-    const gust = acc.gustMax ?? null;
-    const precipMax = acc.precipHourMax ?? null;
-    let thunderVal: number | string = "—";
-    if (thunderDaily && thunderDaily[day] != null) {
-      thunderVal = thunderDaily[day];
-    } else {
-      thunderVal = acc.thunderCount > 0 ? acc.thunderCount : "—";
-    }
-    return {
-      day,
-      windAvg,
-      gust,
-      precipMax,
-      thunder: thunderVal
-    };
-  });
+  const rows = Array.from(byDay.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([day, acc]) => {
+      const windAvg = acc.windN > 0 ? acc.windSum / acc.windN : null;
+      const gust = acc.gustMax ?? null;
+      const precipMax = acc.precipHourMax ?? null;
+      let thunderVal: number | string = "—";
+      if (thunderDaily && thunderDaily[day] != null) {
+        thunderVal = thunderDaily[day];
+      } else {
+        thunderVal = acc.thunderCount > 0 ? acc.thunderCount : "—";
+      }
+      return { day, windAvg, gust, precipMax, thunder: thunderVal };
+    });
 
   return rows;
 }
@@ -135,7 +169,11 @@ function findExtremes(items: SeriesItem[], tz: string) {
   let precipMax: { v: number, iso: string } | null = null;
 
   for (const it of items || []) {
-    const iso = toISOInTZ(new Date(msFromEpoch(it.epoch)), tz);
+    if (it == null) continue;
+    const d = dateFromItem(it);
+    if (!d || Number.isNaN(d.getTime())) continue;
+
+    const iso = toISOInTZ(d, tz);
     if (it.gust_kmh != null && !Number.isNaN(it.gust_kmh)) {
       if (!gustMax || it.gust_kmh > gustMax.v) gustMax = { v: it.gust_kmh, iso };
     }
@@ -146,8 +184,9 @@ function findExtremes(items: SeriesItem[], tz: string) {
   return { gustMax, precipMax };
 }
 
+// ---------- Builder principal ----------
+
 export async function buildReport(ctx: any) {
-  // Inputs tolerantes a variações do endpoint
   const tz: string = ctx?.tz || "Europe/Lisbon";
 
   const place = ctx?.place || ctx?.location || {};
@@ -170,13 +209,13 @@ export async function buildReport(ctx: any) {
   const warnList: Array<any> = ctx?.warnings || ctx?.ipma_warnings || [];
   const newsList: Array<{ title?: string; url: string; date?: string }> = ctx?.news || ctx?.news_links || [];
 
-  // Agregações
+  // Agregações e métricas
   const daily = aggregateDaily(items, tz, thunderDaily);
   const daysWithThunder = daily.filter(r => (typeof r.thunder === "number" ? r.thunder > 0 : r.thunder !== "—")).length;
   const totalThunderHours = daily.reduce((a, r) => a + (typeof r.thunder === "number" ? r.thunder : 0), 0);
   const { gustMax, precipMax } = findExtremes(items, tz);
 
-  // ========= Document =========
+  // ========= Documento =========
   const sections: Paragraph[] | any[] = [];
 
   // Título
@@ -188,9 +227,7 @@ export async function buildReport(ctx: any) {
     }),
     new Paragraph({
       alignment: AlignmentType.CENTER,
-      children: [
-        new TextRun(`${placeName} — ${admin1} (${lat.toFixed(3)}, ${lon.toFixed(3)})`)
-      ]
+      children: [new TextRun(`${placeName} — ${admin1} (${lat.toFixed(3)}, ${lon.toFixed(3)})`)]
     }),
     new Paragraph({
       alignment: AlignmentType.CENTER,
@@ -199,7 +236,7 @@ export async function buildReport(ctx: any) {
     new Paragraph({ text: "" })
   );
 
-  // Resumo (mais completo)
+  // Resumo
   const resumoParas: Paragraph[] = [];
   resumoParas.push(
     para("Resumo"),
@@ -207,7 +244,7 @@ export async function buildReport(ctx: any) {
       children: [
         strong("Enquadramento: "),
         new TextRun(
-          `Análise histórica diária para o período indicado (fuso ${tz}). Os valores apresentados correspondem a média diária do vento a 10 m, rajada máxima diária e precipitação máxima horária por dia.`
+          `Análise histórica diária para o período indicado (fuso ${tz}). Os valores apresentados correspondem à média diária do vento a 10 m, rajada máxima diária e precipitação máxima horária por dia.`
         )
       ]
     }),
@@ -215,119 +252,4 @@ export async function buildReport(ctx: any) {
       children: [
         strong("Extremos do intervalo: "),
         new TextRun(
-          `${gustMax ? `rajada máxima ${gustMax.v.toFixed(1)} km/h em ${gustMax.iso}` : "—"}; `
-        ),
-        new TextRun(
-          `${precipMax ? `precipitação máxima horária ${precipMax.v.toFixed(1)} mm/h em ${precipMax.iso}` : "—"}`
-        )
-      ]
-    }),
-    new Paragraph({
-      children: [
-        strong("Trovoadas: "),
-        new TextRun(
-          `${daysWithThunder} dia(s) com trovoada${totalThunderHours ? ` (${totalThunderHours} h no total)` : ""}.`
-        )
-      ]
-    }),
-    new Paragraph({
-      children: [
-        strong("Qualidade de dados: "),
-        new TextRun(
-          `valores agregados a partir de séries horárias. Quando faltaram observações locais, foi utilizada reanálise (Open-Meteo ERA5/Archive) e/ou estação de referência próxima.`
-        )
-      ]
-    }),
-    para("") // espaço
-  );
-  sections.push(...resumoParas);
-
-  // Tabela diária (SEM coluna Fonte)
-  const tableRows: TableRow[] = [];
-  tableRows.push(
-    new TableRow({
-      cantSplit: true,
-      children: [
-        headerCell("Data"),
-        headerCell("Vento médio (km/h)"),
-        headerCell("Rajada (km/h)"),
-        headerCell("Precipitação (mm/h)"),
-        headerCell("Trovoadas")
-      ]
-    })
-  );
-
-  for (const r of daily) {
-    tableRows.push(
-      new TableRow({
-        cantSplit: true,
-        children: [
-          cell(r.day, false, AlignmentType.LEFT),
-          cell(fmt1(r.windAvg)),
-          cell(fmt1(r.gust)),
-          cell(fmt1(r.precipMax)),
-          cell(typeof r.thunder === "number" ? String(r.thunder) : String(r.thunder))
-        ]
-      })
-    );
-  }
-
-  sections.push(
-    new Paragraph({ text: "Tabela Diária", heading: HeadingLevel.HEADING_2 }),
-    new Table({
-      width: { size: 100, type: WidthType.PERCENTAGE },
-      rows: tableRows,
-      borders: {
-        top: { style: BorderStyle.SINGLE, size: 1, color: "999999" },
-        bottom: { style: BorderStyle.SINGLE, size: 1, color: "999999" },
-        left: { style: BorderStyle.SINGLE, size: 1, color: "999999" },
-        right: { style: BorderStyle.SINGLE, size: 1, color: "999999" },
-        insideHorizontal: { style: BorderStyle.SINGLE, size: 1, color: "DDDDDD" },
-        insideVertical: { style: BorderStyle.SINGLE, size: 1, color: "DDDDDD" }
-      }
-    }),
-    para("")
-  );
-
-  // Avisos (se houver)
-  if (Array.isArray(warnList) && warnList.length) {
-    sections.push(new Paragraph({ text: "Avisos Oficiais", heading: HeadingLevel.HEADING_2 }));
-    for (const w of warnList) {
-      const line =
-        `${w?.source ?? "IPMA"} — ${w?.phenomenon ?? "Fenómeno"} (${w?.level ?? "Nível"}): ${w?.start ?? ""} → ${w?.end ?? ""}`;
-      sections.push(new Paragraph(line));
-      if (w?.url && /^https?:\/\//i.test(w.url)) {
-        sections.push(linkPara("→ abrir aviso", w.url));
-      }
-    }
-    sections.push(para(""));
-  }
-
-  // Fontes e Links (clicáveis)
-  const linkPairs: Array<{ title: string; url: string }> = [];
-
-  for (const [k, v] of Object.entries(sources_links || {})) {
-    if (v && /^https?:\/\//i.test(v)) {
-      linkPairs.push({ title: k.replace(/_/g, " "), url: v });
-    }
-  }
-  // Notícias (se houver)
-  for (const n of newsList || []) {
-    if (n?.url && /^https?:\/\//i.test(n.url)) {
-      linkPairs.push({ title: n.title ? `Notícia — ${n.title}` : "Notícia", url: n.url });
-    }
-  }
-
-  if (linkPairs.length) {
-    sections.push(new Paragraph({ text: "Fontes e Links", heading: HeadingLevel.HEADING_2 }));
-    for (const p of linkPairs) sections.push(linkPara(p.title, p.url));
-  }
-
-  const doc = new Document({
-    sections: [{ children: sections }]
-  });
-
-  // Mantém comportamento actual (retorna Blob; o endpoint converte se precisar)
-  const blob = await Packer.toBlob(doc);
-  return blob;
-}
+          `$
