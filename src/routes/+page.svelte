@@ -4,7 +4,10 @@
 	let lon = '';
 	let data_inicio = '2025-05-02';
 	let data_fim = '2025-05-10';
-	let resolucao = 'hourly';
+
+	// ✅ Daily por defeito
+	let resolucao = 'daily';
+
 	let resultado: any = null;
 	let loading = false;
 	let error = '';
@@ -80,13 +83,17 @@
 			<label for="data_fim">Data de Fim:</label>
 			<input id="data_fim" type="date" bind:value={data_fim} required />
 		</div>
+
+		<!-- ✅ Mantemos o seletor, agora com "Daily" por defeito -->
 		<div class="form-group">
 			<label for="resolucao">Resolução:</label>
 			<select id="resolucao" bind:value={resolucao} required>
+				<option value="daily">Daily</option>
 				<option value="hourly">Hourly</option>
 				<option value="10min">10 minutos</option>
 			</select>
 		</div>
+
 		<div class="btn-row">
 			<button type="submit" disabled={loading} class="btn">{loading ? 'Analisando...' : 'Analisar'}</button>
 			<button type="button" on:click={exportarDocx} class="btn secondary">Exportar .docx</button>
@@ -135,3 +142,4 @@
 	.hint { margin-bottom: 1rem; color: #0369a1; }
 	pre { background: #1e293b; color: #e2e8f0; padding: 1rem; border-radius: 6px; overflow-x: auto; font-size: 0.9rem; line-height: 1.5; }
 </style>
+
