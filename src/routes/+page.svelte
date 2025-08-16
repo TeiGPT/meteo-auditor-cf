@@ -4,9 +4,7 @@
 	let lon = '';
 	let data_inicio = '2025-05-02';
 	let data_fim = '2025-05-10';
-	// só estas duas opções:
-	let resolucao = 'daily';
-
+	let resolucao = 'hourly';
 	let resultado: any = null;
 	let loading = false;
 	let error = '';
@@ -20,10 +18,7 @@
 		try {
 			const params = new URLSearchParams({ data_inicio, data_fim, resolucao });
 			if (local) params.set('local', local);
-			else {
-				params.set('lat', lat);
-				params.set('lon', lon);
-			}
+			else { params.set('lat', lat); params.set('lon', lon); }
 			const response = await fetch(`/api/analisar?${params}`);
 			const data = await response.json();
 			if (response.ok) {
@@ -42,10 +37,7 @@
 		try {
 			const params = new URLSearchParams({ data_inicio, data_fim, resolucao });
 			if (local) params.set('local', local);
-			else {
-				params.set('lat', lat);
-				params.set('lon', lon);
-			}
+			else { params.set('lat', lat); params.set('lon', lon); }
 			const res = await fetch(`/api/analisar.docx?${params}`);
 			reportUrlHeader = res.headers.get('X-Report-URL');
 			if (!res.ok) {
@@ -80,25 +72,21 @@
 			<label for="local">Local:</label>
 			<input id="local" type="text" bind:value={local} placeholder="Cidade/freguesia em Portugal, ex.: Espinho" />
 		</div>
-
 		<div class="form-group">
 			<label for="data_inicio">Data de Início:</label>
 			<input id="data_inicio" type="date" bind:value={data_inicio} required />
 		</div>
-
 		<div class="form-group">
 			<label for="data_fim">Data de Fim:</label>
 			<input id="data_fim" type="date" bind:value={data_fim} required />
 		</div>
-
 		<div class="form-group">
 			<label for="resolucao">Resolução:</label>
 			<select id="resolucao" bind:value={resolucao} required>
-				<option value="daily">Daily</option>
 				<option value="hourly">Hourly</option>
+				<option value="10min">10 minutos</option>
 			</select>
 		</div>
-
 		<div class="btn-row">
 			<button type="submit" disabled={loading} class="btn">{loading ? 'Analisando...' : 'Analisar'}</button>
 			<button type="button" on:click={exportarDocx} class="btn secondary">Exportar .docx</button>
@@ -117,9 +105,7 @@
 		<div class="result">
 			<h3>Resultado da Análise:</h3>
 			{#if resultado.place}
-				<div>
-					Resolvido: {resultado.place.name} ({resultado.place.lat}, {resultado.place.lon}) — distrito {resultado.place.admin1 || '—'} — ICAO {resultado.icao || '—'}
-				</div>
+				<div>Resolvido: {resultado.place.name} ({resultado.place.lat}, {resultado.place.lon}) — distrito {resultado.place.admin1 || '—'} — ICAO {resultado.icao || '—'}</div>
 			{/if}
 			{#if resultado.series && resultado.series.length > 0}
 				{#if resultado.series.filter((s: any) => s.wind_kmh != null || s.gust_kmh != null || s.precip_mm != null).length < (resultado.series.length * 0.2)}

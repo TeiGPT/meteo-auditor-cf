@@ -1,255 +1,137 @@
-// DOCX builder — versão diária + resumo expandido + links clicáveis
-// Gera tabela diária: Data | Vento médio (km/h) | Rajada (km/h) | Precipitação (mm/h) | Trovoadas
-// Remove a coluna "Fonte" e melhora o resumo.
-// Aceita ctx flexível (mantém compatibilidade com o endpoint actual).
+import { Document, HeadingLevel, Packer, Paragraph, Table, TableCell, TableRow, TextRun, AlignmentType, WidthType, SectionType } from 'docx';
+import { toISOInTZ } from '$lib/time';
 
-import {
-  AlignmentType,
-  BorderStyle,
-  Document,
-  ExternalHyperlink,
-  HeadingLevel,
-  Packer,
-  Paragraph,
-  Table,
-  TableCell,
-  TableRow,
-  TextRun,
-  WidthType
-} from "docx";
-
-import { toISOInTZ } from "../time";
-
-type SeriesItem = {
-  epoch?: number; // segundos OU ms (opcional)
-  date?: string;  // "YYYY-MM-DD" (opcional)
-  time?: string;  // ISO (opcional)
-  datetime?: string; // ISO (opcional)
-
-  wind_kmh?: number | null;
-  gust_kmh?: number | null;
-  precip_mm?: number | null; // valor horário (se vier diário pode já estar agregado)
-  thunder?: number | boolean | null; // nº de horas com trovoada (hourly) ou bandeira
+export type SeriesItem = {
+	time: string;
+	wind_kmh: number | null;
+	gust_kmh: number | null;
+	precip_mm: number | null;
+	sources: { wind: string | null; gust: string | null; precip: string | null };
+	thunder?: { type: 'count' | 'flag'; value: number | 'TS' | 'VCTS' | null; source: string };
 };
 
-// ---------- Helpers de tempo/dados ----------
+export type WarningItem = { start: string; end: string; fenomeno: string; nivel: string; link: string };
 
-function msFromEpoch(e: number) {
-  // aceita epoch em segundos ou ms
-  return e < 2e10 ? e * 1000 : e;
+export type SourcesLinks = Record<string, string | undefined>;
+
+export async function buildReport(input: {
+	local: { lat: number; lon: number; label?: string };
+	period: { startISO: string; endISO: string; tz: 'Europe/Lisbon' };
+	series: SeriesItem[];
+	warnings: WarningItem[];
+	sources_links: SourcesLinks;
+}): Promise<{ blob: Blob; arrayBuffer: ArrayBuffer; document: Document }> {
+	const { local, period, series, warnings, sources_links } = input;
+	const title = 'Relatório Meteorológico — Portugal Continental';
+	const subtitle = local.label ? `${local.label} (${local.lat}, ${local.lon})` : `${local.lat}, ${local.lon}`;
+	const tz = period.tz;
+
+	const start = new Date(period.startISO);
+	const end = new Date(period.endISO);
+	const startStr = toISOInTZ(start.getTime(), tz);
+	const endStr = toISOInTZ(end.getTime(), tz);
+	const rangeStr = `${startStr} — ${endStr}`;
+
+	// Summary stats
+	let maxGust = { value: -Infinity as number, time: '' };
+	let maxPrecip = { value: -Infinity as number, time: '' };
+	let thunderHours = 0;
+	let usedReanalysis = false;
+	for (const it of series) {
+		if (typeof it.gust_kmh === 'number' && it.gust_kmh > maxGust.value) {
+			maxGust = { value: it.gust_kmh, time: it.time };
+		}
+		if (typeof it.precip_mm === 'number' && it.precip_mm > maxPrecip.value) {
+			maxPrecip = { value: it.precip_mm, time: it.time };
+		}
+		if (it.thunder) {
+			if (it.thunder.type === 'flag' && (it.thunder.value === 'TS' || it.thunder.value === 'VCTS')) thunderHours += 1;
+			if (it.thunder.type === 'count' && typeof it.thunder.value === 'number' && it.thunder.value > 0) thunderHours += 1;
+		}
+		if (it.sources.wind === 'open-meteo' || it.sources.gust === 'open-meteo' || it.sources.precip === 'open-meteo') usedReanalysis = true;
+	}
+
+	const doc = new Document({
+		sections: [
+			{
+				properties: { type: SectionType.CONTINUOUS },
+				children: [
+					new Paragraph({ text: title, heading: HeadingLevel.TITLE, alignment: AlignmentType.CENTER }),
+					new Paragraph({ text: subtitle, alignment: AlignmentType.CENTER }),
+					new Paragraph({ text: rangeStr, alignment: AlignmentType.CENTER }),
+					new Paragraph({ text: '' }),
+					...(series.length === 0 || series.filter((s) => s.wind_kmh != null || s.gust_kmh != null || s.precip_mm != null).length < Math.max(1, Math.floor(series.length * 0.2))
+						? [new Paragraph({ text: 'Sem dados suficientes para o intervalo' }), new Paragraph({ text: '' })]
+						: []),
+					new Paragraph({ text: 'Resumo', heading: HeadingLevel.HEADING_2 }),
+					new Paragraph({ text: `Pico de rajada: ${isFinite(maxGust.value) ? maxGust.value.toFixed(1) + ' km/h' : '—'} em ${maxGust.time || '—'}` }),
+					new Paragraph({ text: `Prec. máxima/hora: ${isFinite(maxPrecip.value) ? maxPrecip.value.toFixed(1) + ' mm' : '—'} em ${maxPrecip.time || '—'}` }),
+					new Paragraph({ text: `Horas com trovoada: ${thunderHours}` }),
+					new Paragraph({ text: usedReanalysis ? 'Observação: dados parcialmente preenchidos por reanálise (Open-Meteo).' : 'Observação: dados observacionais predominantes.' }),
+					new Paragraph({ text: '' }),
+					new Paragraph({ text: 'Tabela Horária', heading: HeadingLevel.HEADING_2 }),
+					buildTable(series, tz),
+					new Paragraph({ text: '' }),
+					new Paragraph({ text: 'Avisos IPMA/Meteoalarm', heading: HeadingLevel.HEADING_2 }),
+					...buildWarnings(warnings, tz),
+					new Paragraph({ text: '' }),
+					new Paragraph({ text: 'Fontes e Links', heading: HeadingLevel.HEADING_2 }),
+					...buildSourcesLinks(sources_links)
+				]
+			}
+		]
+	});
+
+	const blob = await Packer.toBlob(doc);
+	const arrayBuffer = await blob.arrayBuffer();
+	return { blob, arrayBuffer, document: doc };
 }
 
-function dateFromItem(it: SeriesItem): Date | null {
-  if (it == null) return null;
-  if (typeof it.epoch === "number" && Number.isFinite(it.epoch)) {
-    return new Date(msFromEpoch(it.epoch));
-  }
-  if (typeof it.time === "string") {
-    const d = new Date(it.time);
-    if (!Number.isNaN(d.getTime())) return d;
-  }
-  if (typeof it.datetime === "string") {
-    const d = new Date(it.datetime);
-    if (!Number.isNaN(d.getTime())) return d;
-  }
-  if (typeof it.date === "string") {
-    const d = new Date(it.date + "T00:00:00");
-    if (!Number.isNaN(d.getTime())) return d;
-  }
-  return null;
+function buildTable(series: SeriesItem[], tz: string): Table {
+	const header = new TableRow({
+		children: ['Data-Hora', 'Vento (km/h)', 'Rajada (km/h)', 'Precipitação (mm)', 'Trovoada', 'Fonte'].map((t) =>
+			new TableCell({ children: [new Paragraph({ text: t })] })
+		)
+	});
+	const rows = series.map((it) => {
+		const thunderStr = it.thunder ? (it.thunder.type === 'flag' ? String(it.thunder.value ?? '') : String(it.thunder.value ?? 0)) : '';
+		const fonteParts: string[] = [];
+		if (it.sources.wind) fonteParts.push(`${it.sources.wind === 'meteostat' ? 'M' : 'OM'}:W`);
+		if (it.sources.gust) fonteParts.push(`${it.sources.gust === 'meteostat' ? 'M' : 'OM'}:G`);
+		if (it.sources.precip) fonteParts.push(`${it.sources.precip === 'meteostat' ? 'M' : 'OM'}:P`);
+		if (it.thunder) fonteParts.push(it.thunder.source.toUpperCase());
+		const fonte = fonteParts.join(' / ');
+		return new TableRow({
+			children: [
+				new TableCell({ children: [new Paragraph({ text: it.time || '—' })] }),
+				new TableCell({ children: [new Paragraph({ text: fmtNum(it.wind_kmh) })] }),
+				new TableCell({ children: [new Paragraph({ text: fmtNum(it.gust_kmh) })] }),
+				new TableCell({ children: [new Paragraph({ text: fmtNum(it.precip_mm) })] }),
+				new TableCell({ children: [new Paragraph({ text: thunderStr })] }),
+				new TableCell({ children: [new Paragraph({ text: fonte })] })
+			]
+		});
+	});
+	return new Table({
+		width: { size: 100, type: WidthType.PERCENTAGE },
+		rows: [header, ...rows]
+	});
 }
 
-function dayKey(d: Date, tz: string) {
-  // YYYY-MM-DD na timezone desejada
-  const iso = toISOInTZ(d, tz);
-  return iso.slice(0, 10);
+function fmtNum(v: number | null): string {
+	return typeof v === 'number' && isFinite(v) ? v.toFixed(1) : '—';
 }
 
-function fmt1(x: number | null | undefined, unit = "") {
-  if (x == null || Number.isNaN(x)) return "—";
-  return `${x.toFixed(1)}${unit}`;
+function buildWarnings(list: WarningItem[], tz: string): Paragraph[] {
+	if (!list || list.length === 0) return [new Paragraph({ text: 'Sem avisos no período.' })];
+	return list.map((w) => new Paragraph({ text: `${w.fenomeno} — ${w.nivel} — ${w.start} → ${w.end} — ${w.link}` }));
 }
 
-function cell(text: string, bold = false, align: AlignmentType = AlignmentType.CENTER) {
-  return new TableCell({
-    children: [
-      new Paragraph({
-        alignment: align,
-        children: [new TextRun({ text, bold })]
-      })
-    ]
-  });
+function buildSourcesLinks(links: SourcesLinks): Paragraph[] {
+	const out: Paragraph[] = [];
+	for (const [k, v] of Object.entries(links)) {
+		if (!v) continue;
+		out.push(new Paragraph({ text: `${k}: ${v}` }));
+	}
+	return out.length ? out : [new Paragraph({ text: 'Sem links de fontes.' })];
 }
-
-function headerCell(text: string) {
-  return cell(text, true, AlignmentType.CENTER);
-}
-
-function strong(text: string) {
-  return new TextRun({ text, bold: true });
-}
-
-function para(text: string) {
-  return new Paragraph(text);
-}
-
-function linkPara(title: string, url: string) {
-  const text = title || url;
-  return new Paragraph({
-    children: [
-      new ExternalHyperlink({
-        link: url,
-        children: [new TextRun({ text, style: "Hyperlink" })]
-      })
-    ]
-  });
-}
-
-// ---------- Agregações ----------
-
-// Agrega série HORÁRIA (ou mistura) -> DIÁRIA
-function aggregateDaily(items: SeriesItem[], tz: string, thunderDaily?: Record<string, number>) {
-  type Acc = {
-    windSum: number; windN: number;
-    gustMax: number | null;
-    precipHourMax: number | null;
-    thunderCount: number; // horas com TS (se vier hourly) quando não existir thunderDaily
-  };
-  const byDay = new Map<string, Acc>();
-
-  for (const it of items || []) {
-    const d = dateFromItem(it);
-    if (!d || Number.isNaN(d.getTime())) continue;
-
-    const day = dayKey(d, tz);
-    const acc = byDay.get(day) || {
-      windSum: 0, windN: 0,
-      gustMax: null,
-      precipHourMax: null,
-      thunderCount: 0
-    };
-
-    if (it.wind_kmh != null && !Number.isNaN(it.wind_kmh)) {
-      acc.windSum += it.wind_kmh;
-      acc.windN += 1;
-    }
-    if (it.gust_kmh != null && !Number.isNaN(it.gust_kmh)) {
-      acc.gustMax = acc.gustMax == null ? it.gust_kmh : Math.max(acc.gustMax, it.gust_kmh);
-    }
-    if (it.precip_mm != null && !Number.isNaN(it.precip_mm)) {
-      // queremos o pico horário do dia
-      acc.precipHourMax = acc.precipHourMax == null ? it.precip_mm : Math.max(acc.precipHourMax, it.precip_mm);
-    }
-    if (it.thunder) acc.thunderCount += Number(it.thunder) || 1;
-
-    byDay.set(day, acc);
-  }
-
-  const rows = Array.from(byDay.entries())
-    .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([day, acc]) => {
-      const windAvg = acc.windN > 0 ? acc.windSum / acc.windN : null;
-      const gust = acc.gustMax ?? null;
-      const precipMax = acc.precipHourMax ?? null;
-      let thunderVal: number | string = "—";
-      if (thunderDaily && thunderDaily[day] != null) {
-        thunderVal = thunderDaily[day];
-      } else {
-        thunderVal = acc.thunderCount > 0 ? acc.thunderCount : "—";
-      }
-      return { day, windAvg, gust, precipMax, thunder: thunderVal };
-    });
-
-  return rows;
-}
-
-// Procura extremos na série horária (para o resumo)
-function findExtremes(items: SeriesItem[], tz: string) {
-  let gustMax: { v: number, iso: string } | null = null;
-  let precipMax: { v: number, iso: string } | null = null;
-
-  for (const it of items || []) {
-    if (it == null) continue;
-    const d = dateFromItem(it);
-    if (!d || Number.isNaN(d.getTime())) continue;
-
-    const iso = toISOInTZ(d, tz);
-    if (it.gust_kmh != null && !Number.isNaN(it.gust_kmh)) {
-      if (!gustMax || it.gust_kmh > gustMax.v) gustMax = { v: it.gust_kmh, iso };
-    }
-    if (it.precip_mm != null && !Number.isNaN(it.precip_mm)) {
-      if (!precipMax || it.precip_mm > precipMax.v) precipMax = { v: it.precip_mm, iso };
-    }
-  }
-  return { gustMax, precipMax };
-}
-
-// ---------- Builder principal ----------
-
-export async function buildReport(ctx: any) {
-  const tz: string = ctx?.tz || "Europe/Lisbon";
-
-  const place = ctx?.place || ctx?.location || {};
-  const placeName: string = place?.name || "—";
-  const admin1: string = place?.admin1 || "—";
-  const lat = place?.lat ?? place?.latitude ?? 0;
-  const lon = place?.lon ?? place?.longitude ?? 0;
-
-  const startISO: string =
-    ctx?.startISO || ctx?.start || ctx?.period?.startISO || ctx?.range?.startISO || ctx?.data_inicio_iso || ctx?.inicio_iso || "—";
-  const endISO: string =
-    ctx?.endISO || ctx?.end || ctx?.period?.endISO || ctx?.range?.endISO || ctx?.data_fim_iso || ctx?.fim_iso || "—";
-
-  const items: SeriesItem[] = ctx?.items || ctx?.series || [];
-  const thunderDaily: Record<string, number> | undefined =
-    ctx?.thunderDaily || ctx?.thunder_daily || ctx?.ipma_dea_daily;
-
-  // Links e avisos
-  const sources_links: Record<string, string> = ctx?.sources_links || ctx?.links || {};
-  const warnList: Array<any> = ctx?.warnings || ctx?.ipma_warnings || [];
-  const newsList: Array<{ title?: string; url: string; date?: string }> = ctx?.news || ctx?.news_links || [];
-
-  // Agregações e métricas
-  const daily = aggregateDaily(items, tz, thunderDaily);
-  const daysWithThunder = daily.filter(r => (typeof r.thunder === "number" ? r.thunder > 0 : r.thunder !== "—")).length;
-  const totalThunderHours = daily.reduce((a, r) => a + (typeof r.thunder === "number" ? r.thunder : 0), 0);
-  const { gustMax, precipMax } = findExtremes(items, tz);
-
-  // ========= Documento =========
-  const sections: Paragraph[] | any[] = [];
-
-  // Título
-  sections.push(
-    new Paragraph({
-      heading: HeadingLevel.TITLE,
-      alignment: AlignmentType.CENTER,
-      children: [new TextRun("Relatório Meteorológico — Portugal Continental")]
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      children: [new TextRun(`${placeName} — ${admin1} (${lat.toFixed(3)}, ${lon.toFixed(3)})`)]
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      children: [new TextRun(`${startISO} — ${endISO}`)]
-    }),
-    new Paragraph({ text: "" })
-  );
-
-  // Resumo
-  const resumoParas: Paragraph[] = [];
-  resumoParas.push(
-    para("Resumo"),
-    new Paragraph({
-      children: [
-        strong("Enquadramento: "),
-        new TextRun(
-          `Análise histórica diária para o período indicado (fuso ${tz}). Os valores apresentados correspondem à média diária do vento a 10 m, rajada máxima diária e precipitação máxima horária por dia.`
-        )
-      ]
-    }),
-    new Paragraph({
-      children: [
-        strong("Extremos do intervalo: "),
-        new TextRun(
-          `$
