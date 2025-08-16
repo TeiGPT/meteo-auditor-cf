@@ -20,6 +20,7 @@
 		"vite": "^7.0.4"
 	},
 	"dependencies": {
-		"@sveltejs/adapter-cloudflare": "^7.2.0"
+		"@sveltejs/adapter-cloudflare": "^7.2.0",
+		"docx": "^9.5.1"
 	}
 }

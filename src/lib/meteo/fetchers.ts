@@ -1,4 +1,5 @@
 /* Utilities to fetch Meteostat and Open-Meteo hourly data and merge them */
+import { toISOInTZ } from '$lib/time';
 
 export type Source = 'meteostat' | 'open-meteo';
 
@@ -71,15 +72,14 @@ export type MeteostatResult = {
 	size: number;
 };
 
+export type OpenMeteoItem = { epoch: number; wind_kmh: number | null; gust_kmh: number | null; precip_mm: number | null };
 export type OpenMeteoResult = {
 	url: string;
 	available: boolean;
-	time: string[];
-	wind_speed_10m: Array<number | null>;
-	wind_gusts_10m: Array<number | null>;
-	precipitation: Array<number | null>;
+	items: OpenMeteoItem[];
 	utc_offset_seconds: number;
 	size: number;
+	usedArchiveFallback: boolean;
 };
 
 export async function fetchMeteostatHourly(
@@ -120,6 +120,20 @@ export async function fetchMeteostatHourly(
 	}
 }
 
+function sanitizeNumericArray(arr: Array<number | string | null | undefined>, len: number): Array<number | null> {
+	const out: Array<number | null> = new Array(len);
+	for (let i = 0; i < len; i++) {
+		const v = arr?.[i];
+		if (v === null || v === undefined) {
+			out[i] = null;
+			continue;
+		}
+		const n = typeof v === 'number' ? v : Number(v);
+		out[i] = Number.isFinite(n) ? n : null;
+	}
+	return out;
+}
+
 export async function fetchOpenMeteoHourly(
 	fetchFn: typeof fetch,
 	lat: number,
@@ -128,31 +142,61 @@ export async function fetchOpenMeteoHourly(
 	endISODate: string,
 	tz = 'Europe/Lisbon'
 ): Promise<OpenMeteoResult> {
-	const base = 'https://reanalysis.open-meteo.com/v1/era5';
-	const params = new URLSearchParams({
-		latitude: String(lat),
-		longitude: String(lon),
-		hourly: ['wind_speed_10m', 'wind_gusts_10m', 'precipitation'].join(','),
-		start_date: startISODate,
-		end_date: endISODate,
-		timezone: tz
-	});
-	const url = `${base}?${params.toString()}`;
+	const buildUrl = (base: string) => {
+		const params = new URLSearchParams({
+			latitude: String(lat),
+			longitude: String(lon),
+			hourly: ['wind_speed_10m', 'wind_gusts_10m', 'precipitation'].join(','),
+			start_date: startISODate,
+			end_date: endISODate,
+			timezone: tz
+		});
+		return `${base}?${params.toString()}`;
+	};
+	const primaryUrl = buildUrl('https://reanalysis.open-meteo.com/v1/era5');
+	let urlUsed = primaryUrl;
+	let usedArchiveFallback = false;
 	try {
-		const res = await fetchFn(url);
-		if (!res.ok) return { url, available: false, time: [], wind_speed_10m: [], wind_gusts_10m: [], precipitation: [], utc_offset_seconds: 0, size: 0 };
-		const json = await res.json();
-		const hourly = json?.hourly ?? {};
-		const time: string[] = (hourly?.time as string[]) ?? [];
-		const wind_speed_10m = (hourly?.wind_speed_10m as Array<number | null>) ?? [];
-		const wind_gusts_10m = (hourly?.wind_gusts_10m as Array<number | null>) ?? [];
-		const precipitation = (hourly?.precipitation as Array<number | null>) ?? [];
-		const utc_offset_seconds: number = Number(json?.utc_offset_seconds ?? 0);
-		const size = time.length;
-		if (!size) return { url, available: false, time: [], wind_speed_10m: [], wind_gusts_10m: [], precipitation: [], utc_offset_seconds, size: 0 };
-		return { url, available: true, time, wind_speed_10m, wind_gusts_10m, precipitation, utc_offset_seconds, size };
+		let res = await fetchFn(primaryUrl);
+		let json: any = null;
+		if (res.ok) json = await res.json();
+		let hourly = json?.hourly ?? {};
+		let timeRaw: string[] = (hourly?.time as string[]) ?? [];
+		let wspdRaw: Array<number | null | undefined> = (hourly?.wind_speed_10m as any[]) ?? [];
+		let wgstRaw: Array<number | null | undefined> = (hourly?.wind_gusts_10m as any[]) ?? [];
+		let prcpRaw: Array<number | null | undefined> = (hourly?.precipitation as any[]) ?? [];
+		let utc_offset_seconds: number = Number(json?.utc_offset_seconds ?? 0);
+		let len = Math.min(timeRaw.length, wspdRaw.length, wgstRaw.length, prcpRaw.length);
+		if (!len) {
+			const fallbackUrl = buildUrl('https://archive-api.open-meteo.com/v1/archive');
+			urlUsed = fallbackUrl;
+			usedArchiveFallback = true;
+			res = await fetchFn(fallbackUrl);
+			if (!res.ok) return { url: urlUsed, available: false, items: [], utc_offset_seconds: 0, size: 0, usedArchiveFallback };
+			json = await res.json();
+			hourly = json?.hourly ?? {};
+			timeRaw = (hourly?.time as string[]) ?? [];
+			wspdRaw = (hourly?.wind_speed_10m as any[]) ?? [];
+			wgstRaw = (hourly?.wind_gusts_10m as any[]) ?? [];
+			prcpRaw = (hourly?.precipitation as any[]) ?? [];
+			utc_offset_seconds = Number(json?.utc_offset_seconds ?? 0);
+			len = Math.min(timeRaw.length, wspdRaw.length, wgstRaw.length, prcpRaw.length);
+			if (!len) return { url: urlUsed, available: false, items: [], utc_offset_seconds, size: 0, usedArchiveFallback };
+		}
+		const time = timeRaw.slice(0, len);
+		const wind_speed_10m = sanitizeNumericArray(wspdRaw, len);
+		const wind_gusts_10m = sanitizeNumericArray(wgstRaw, len);
+		const precipitation = sanitizeNumericArray(prcpRaw, len);
+		const epochs = toEpochsFromLocalTimes(time, utc_offset_seconds);
+		const items: OpenMeteoItem[] = epochs.map((epoch, i) => ({
+			epoch,
+			wind_kmh: wind_speed_10m[i] == null ? null : toKmH(wind_speed_10m[i]!),
+			gust_kmh: wind_gusts_10m[i] == null ? null : toKmH(wind_gusts_10m[i]!),
+			precip_mm: precipitation[i] == null ? null : precipitation[i]!
+		}));
+		return { url: urlUsed, available: true, items, utc_offset_seconds, size: items.length, usedArchiveFallback };
 	} catch {
-		return { url, available: false, time: [], wind_speed_10m: [], wind_gusts_10m: [], precipitation: [], utc_offset_seconds: 0, size: 0 };
+		return { url: urlUsed, available: false, items: [], utc_offset_seconds: 0, size: 0, usedArchiveFallback };
 	}
 }
 
@@ -191,21 +235,17 @@ export function mergeByEpoch(
 	timelineEpochs: number[],
 	meteostatIdx: Map<number, number>,
 	meteostat: { ws: (number | null)[]; wpgt: (number | null)[]; prcp: (number | null)[] },
-	openIdx: Map<number, number>,
-	open: { wind_speed_10m: (number | null)[]; wind_gusts_10m: (number | null)[]; precipitation: (number | null)[] },
-	offsetSeconds: number
+	openMap: Map<number, OpenMeteoItem>,
+	tz: string
 ): HourlyMerged[] {
 	const out: HourlyMerged[] = [];
 	for (const epoch of timelineEpochs) {
 		const mi = meteostatIdx.get(epoch);
-		const oi = openIdx.get(epoch);
+		const om = openMap.get(epoch);
 
 		const ms_ws = mi !== undefined ? meteostat.ws[mi] ?? null : null;
-		const om_ws = oi !== undefined ? open.wind_speed_10m[oi] ?? null : null;
 		const ms_wpgt = mi !== undefined ? meteostat.wpgt[mi] ?? null : null;
-		const om_wpgt = oi !== undefined ? open.wind_gusts_10m[oi] ?? null : null;
 		const ms_prcp = mi !== undefined ? meteostat.prcp[mi] ?? null : null;
-		const om_prcp = oi !== undefined ? open.precipitation[oi] ?? null : null;
 
 		let wind_kmh: number | null = null;
 		let gust_kmh: number | null = null;
@@ -215,29 +255,29 @@ export function mergeByEpoch(
 		if (ms_ws != null) {
 			wind_kmh = round1(toKmH(ms_ws));
 			sources.wind = 'meteostat';
-		} else if (om_ws != null) {
-			wind_kmh = round1(toKmH(om_ws));
+		} else if (om && om.wind_kmh != null) {
+			wind_kmh = round1(om.wind_kmh);
 			sources.wind = 'open-meteo';
 		}
 
 		if (ms_wpgt != null) {
 			gust_kmh = round1(toKmH(ms_wpgt));
 			sources.gust = 'meteostat';
-		} else if (om_wpgt != null) {
-			gust_kmh = round1(toKmH(om_wpgt));
+		} else if (om && om.gust_kmh != null) {
+			gust_kmh = round1(om.gust_kmh);
 			sources.gust = 'open-meteo';
 		}
 
 		if (ms_prcp != null) {
 			precip_mm = Number(ms_prcp);
 			sources.precip = 'meteostat';
-		} else if (om_prcp != null) {
-			precip_mm = Number(om_prcp);
+		} else if (om && om.precip_mm != null) {
+			precip_mm = Number(om.precip_mm);
 			sources.precip = 'open-meteo';
 		}
 
 		out.push({
-			time: toLisbonIsoWithOffset(epoch, offsetSeconds),
+			time: toISOInTZ(epoch, tz),
 			wind_kmh,
 			gust_kmh,
 			precip_mm,
