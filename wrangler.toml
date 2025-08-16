@@ -1,3 +1,9 @@
+# wrangler.toml — Cloudflare Pages + SvelteKit
 name = "meteo-auditor-cf"
-compatibility_date = "2024-12-01"
+
+# DIZ ao Pages qual é a pasta de build (é isto que estava a faltar)
+pages_build_output_dir = ".svelte-kit/cloudflare"
+
+# Node.js compatibility para permitir 'buffer', 'stream', etc. no Worker
+compatibility_date = "2025-08-16"     # (>= 2024-09-23 é obrigatório)
 compatibility_flags = ["nodejs_compat"]
