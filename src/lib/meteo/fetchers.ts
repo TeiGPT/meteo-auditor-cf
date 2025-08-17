@@ -1,4 +1,5 @@
 /* Utilities to fetch Meteostat and Open-Meteo hourly data and merge them */
+/* Versão "dados reais": Meteostat model=false; nada de reanálise por defeito */
 import { toISOInTZ } from '$lib/time';
 
 export type Source = 'meteostat' | 'open-meteo';
@@ -25,8 +26,8 @@ export type HourlyMerged = {
 
 /**
  * ATENÇÃO:
- * Meteostat e Open-Meteo (com windspeed_unit=kmh) já devolvem km/h.
- * Mantemos a função por compatibilidade, mas agora é identidade.
+ * Nesta versão, tratamos os valores já como km/h quando vêm da API.
+ * Mantemos a função por compatibilidade – identidade.
  */
 export function toKmH(ms: number | null | undefined): number | null {
   if (ms === null || ms === undefined) return null;
@@ -67,12 +68,14 @@ export function toLisbonIsoWithOffset(epochMs: number, offsetSeconds: number): s
   return `${y}-${m}-${d}T${h}:00:00${offset}`;
 }
 
+/* ===================== FETCHERS ===================== */
+
 export type MeteostatResult = {
   url: string;
   available: boolean;
   time: string[];
-  ws: Array<number | null>;
-  wpgt: Array<number | null>;
+  ws: Array<number | null>;   // km/h
+  wpgt: Array<number | null>; // km/h
   prcp: Array<number | null>;
   size: number;
 };
@@ -92,6 +95,10 @@ export type OpenMeteoResult = {
   usedArchiveFallback: boolean;
 };
 
+/**
+ * Meteostat (observações reais apenas) — model=false
+ * ws/wpgt assumidos em km/h (ver nota no teu pipeline).
+ */
 export async function fetchMeteostatHourly(
   fetchFn: typeof fetch,
   lat: number,
@@ -106,31 +113,40 @@ export async function fetchMeteostatHourly(
     start: startISODate,
     end: endISODate,
     tz: 'Europe/Lisbon',
-    model: 'true'
+    // 👇 Só dados medidos; sem preenchimento por modelo
+    model: 'false'
   });
   const url = `${base}?${params.toString()}`;
   try {
     const headers: Record<string, string> = {};
     const apiKey = (globalThis as any)?.process?.env?.METEOSTAT_API_KEY;
     if (apiKey) headers['X-Api-Key'] = String(apiKey);
+
     const res = await fetchFn(url, { headers });
     if (!res.ok) {
       return { url, available: false, time: [], ws: [], wpgt: [], prcp: [], size: 0 };
     }
+
     const json = await res.json().catch(() => ({} as any));
     const data: Array<any> = (json?.data as any[]) || [];
     if (!data.length) return { url, available: false, time: [], ws: [], wpgt: [], prcp: [], size: 0 };
+
     const time: string[] = data.map((r) => String(r.time ?? r.date ?? ''));
-    // Meteostat já está em km/h
-    const ws = data.map((r) => (r.ws ?? r.wspd ?? null));
-    const wpgt = data.map((r) => (r.wpgt ?? null));
-    const prcp = data.map((r) => (r.prcp ?? null));
+    // Assumimos que a API devolve ws/wpgt em km/h no teu ambiente
+    const ws   = data.map((r) => (r.ws   ?? r.wspd ?? null)) as Array<number | null>;
+    const wpgt = data.map((r) => (r.wpgt ?? null)) as Array<number | null>;
+    const prcp = data.map((r) => (r.prcp ?? null)) as Array<number | null>;
+
     return { url, available: true, time, ws, wpgt, prcp, size: time.length };
   } catch {
     return { url, available: false, time: [], ws: [], wpgt: [], prcp: [], size: 0 };
   }
 }
 
+/**
+ * Open-Meteo ERA5/Archive — reanálise (opcional).
+ * km/h forçados para evitar conversões.
+ */
 function sanitizeNumericArray(arr: Array<number | string | null | undefined>, len: number): Array<number | null> {
   const out: Array<number | null> = new Array(len);
   for (let i = 0; i < len; i++) {
@@ -161,7 +177,7 @@ export async function fetchOpenMeteoHourly(
       start_date: startISODate,
       end_date: endISODate,
       timezone: tz,
-      windspeed_unit: 'kmh' // força km/h para eliminar ambiguidades
+      windspeed_unit: 'kmh' // km/h para evitar multiplicações
     });
     return `${base}?${params.toString()}`;
   };
@@ -209,8 +225,8 @@ export async function fetchOpenMeteoHourly(
     const epochs = toEpochsFromLocalTimes(time, utc_offset_seconds);
     const items: OpenMeteoItem[] = epochs.map((epoch, i) => ({
       epoch,
-      wind_kmh: wind_speed_10m[i] == null ? null : wind_speed_10m[i]!, // já km/h
-      gust_kmh: wind_gusts_10m[i] == null ? null : wind_gusts_10m[i]!, // já km/h
+      wind_kmh: wind_speed_10m[i] == null ? null : wind_speed_10m[i]!,
+      gust_kmh: wind_gusts_10m[i] == null ? null : wind_gusts_10m[i]!,
       precip_mm: precipitation[i] == null ? null : precipitation[i]!
     }));
 
@@ -219,6 +235,8 @@ export async function fetchOpenMeteoHourly(
     return { url: urlUsed, available: false, items: [], utc_offset_seconds: 0, size: 0, usedArchiveFallback };
   }
 }
+
+/* ===================== TIME HELPERS ===================== */
 
 function parseLocalHourToEpoch(localHour: string, offsetSeconds: number): number {
   const s = localHour.replace(' ', 'T');
@@ -251,17 +269,26 @@ export function generateEpochsForLocalRange(startYMD: string, endYMD: string, of
   return out;
 }
 
+/* ===================== MERGE ===================== */
+
+/**
+ * Junta as séries por época (hora). Por defeito **NÃO** usa reanálise.
+ * Para permitir fallback, passa { useOpenMeteoFallback: true }.
+ */
 export function mergeByEpoch(
   timelineEpochs: number[],
   meteostatIdx: Map<number, number>,
   meteostat: { ws: (number | null)[]; wpgt: (number | null)[]; prcp: (number | null)[] },
   openMap: Map<number, OpenMeteoItem>,
-  tz: string
+  tz: string,
+  opts?: { useOpenMeteoFallback?: boolean }
 ): HourlyMerged[] {
+  const useOM = !!opts?.useOpenMeteoFallback;
   const out: HourlyMerged[] = [];
+
   for (const epoch of timelineEpochs) {
     const mi = meteostatIdx.get(epoch);
-    const om = openMap.get(epoch);
+    const om = openMap.get(epoch); // só usado se useOM=true
 
     const ms_ws   = mi !== undefined ? meteostat.ws[mi]   ?? null : null; // km/h
     const ms_wpgt = mi !== undefined ? meteostat.wpgt[mi] ?? null : null; // km/h
@@ -272,11 +299,11 @@ export function mergeByEpoch(
     let precip_mm: number | null = null;
     const sources: SourceRecord = { wind: null, gust: null, precip: null };
 
-    // Meteostat → já km/h
+    // 1) Preferir sempre Meteostat (observado)
     if (ms_ws != null) {
       wind_kmh = round1(ms_ws);
       sources.wind = 'meteostat';
-    } else if (om && om.wind_kmh != null) {
+    } else if (useOM && om && om.wind_kmh != null) {
       wind_kmh = round1(om.wind_kmh);
       sources.wind = 'open-meteo';
     }
@@ -284,7 +311,7 @@ export function mergeByEpoch(
     if (ms_wpgt != null) {
       gust_kmh = round1(ms_wpgt);
       sources.gust = 'meteostat';
-    } else if (om && om.gust_kmh != null) {
+    } else if (useOM && om && om.gust_kmh != null) {
       gust_kmh = round1(om.gust_kmh);
       sources.gust = 'open-meteo';
     }
@@ -292,7 +319,7 @@ export function mergeByEpoch(
     if (ms_prcp != null) {
       precip_mm = Number(ms_prcp);
       sources.precip = 'meteostat';
-    } else if (om && om.precip_mm != null) {
+    } else if (useOM && om && om.precip_mm != null) {
       precip_mm = Number(om.precip_mm);
       sources.precip = 'open-meteo';
     }
