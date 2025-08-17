@@ -4,7 +4,7 @@ import {
 } from 'docx';
 
 export type SeriesItem = {
-	time: string; // ISO preferencial; aceitamos “YYYY-MM-DDTHH:MM” ou semelhante
+	time: string; // ISO preferencial
 	wind_kmh: number | null;
 	gust_kmh: number | null;
 	precip_mm: number | null;
@@ -24,16 +24,14 @@ function para(text: string) { return new Paragraph({ text }); }
 function bold(text: string) { return new TextRun({ text, bold: true }); }
 
 function dayFromTimeStr(ts: string): string {
-	// tenta apanhar YYYY-MM-DD logo no início
 	const m = /^(\d{4}-\d{2}-\d{2})/.exec(ts);
 	if (m) return m[1];
 	const d = new Date(ts);
 	if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
-	return ts.slice(0, 10); // fallback bruto
+	return ts.slice(0, 10);
 }
 
 function buildHourlyTable(series: SeriesItem[]): Table {
-	// Sem coluna “Fonte”
 	const header = new TableRow({
 		children: ['Data-Hora', 'Vento (km/h)', 'Rajada (km/h)', 'Precipitação (mm)', 'Trovoada']
 			.map((t) => new TableCell({ children: [new Paragraph({ text: t })] }))
@@ -56,13 +54,19 @@ function buildHourlyTable(series: SeriesItem[]): Table {
 }
 
 function buildDailyTable(series: SeriesItem[]): Table {
-	type Acc = { n: number; windSum: number; gustMax: number; precipMax: number; thunderCount: number; };
+	// agregação por PICO diário (máximos), não médias
+	type Acc = { windMax: number; gustMax: number; precipMax: number; thunderCount: number; };
 	const byDay = new Map<string, Acc>();
 
 	for (const it of series) {
 		const day = dayFromTimeStr(it.time);
-		const acc = byDay.get(day) ?? { n: 0, windSum: 0, gustMax: Number.NEGATIVE_INFINITY, precipMax: Number.NEGATIVE_INFINITY, thunderCount: 0 };
-		if (typeof it.wind_kmh === 'number') { acc.windSum += it.wind_kmh; acc.n += 1; }
+		const acc = byDay.get(day) ?? {
+			windMax: Number.NEGATIVE_INFINITY,
+			gustMax: Number.NEGATIVE_INFINITY,
+			precipMax: Number.NEGATIVE_INFINITY,
+			thunderCount: 0
+		};
+		if (typeof it.wind_kmh === 'number') acc.windMax = Math.max(acc.windMax, it.wind_kmh);
 		if (typeof it.gust_kmh === 'number') acc.gustMax = Math.max(acc.gustMax, it.gust_kmh);
 		if (typeof it.precip_mm === 'number') acc.precipMax = Math.max(acc.precipMax, it.precip_mm);
 		if (it.thunder) {
@@ -73,18 +77,17 @@ function buildDailyTable(series: SeriesItem[]): Table {
 	}
 
 	const header = new TableRow({
-		children: ['Data', 'Vento médio (km/h)', 'Rajada (km/h)', 'Precipitação máx. (mm/h)', 'Trovoadas (h)']
+		children: ['Data', 'Vento máx. (km/h)', 'Rajada máx. (km/h)', 'Precipitação máx. (mm/h)', 'Trovoadas (h)']
 			.map((t) => new TableCell({ children: [new Paragraph({ text: t })] }))
 	});
 
 	const days = [...byDay.keys()].sort();
 	const rows = days.map((day) => {
 		const acc = byDay.get(day)!;
-		const windAvg = acc.n > 0 ? acc.windSum / acc.n : null;
 		return new TableRow({
 			children: [
 				new TableCell({ children: [new Paragraph({ text: day })] }),
-				new TableCell({ children: [new Paragraph({ text: fmtNum(windAvg) })] }),
+				new TableCell({ children: [new Paragraph({ text: isFinite(acc.windMax) ? acc.windMax.toFixed(1) : '—' })] }),
 				new TableCell({ children: [new Paragraph({ text: isFinite(acc.gustMax) ? acc.gustMax.toFixed(1) : '—' })] }),
 				new TableCell({ children: [new Paragraph({ text: isFinite(acc.precipMax) ? acc.precipMax.toFixed(1) : '—' })] }),
 				new TableCell({ children: [new Paragraph({ text: acc.thunderCount ? String(acc.thunderCount) : '—' })] })
@@ -96,14 +99,16 @@ function buildDailyTable(series: SeriesItem[]): Table {
 }
 
 function extremes(series: SeriesItem[]) {
+	let windMax: { v: number; t: string } | null = null;
 	let gustMax: { v: number; t: string } | null = null;
 	let precipMax: { v: number; t: string } | null = null;
 
 	for (const it of series) {
+		if (typeof it.wind_kmh === 'number' && (windMax == null || it.wind_kmh > windMax.v)) windMax = { v: it.wind_kmh, t: it.time };
 		if (typeof it.gust_kmh === 'number' && (gustMax == null || it.gust_kmh > gustMax.v)) gustMax = { v: it.gust_kmh, t: it.time };
 		if (typeof it.precip_mm === 'number' && (precipMax == null || it.precip_mm > precipMax.v)) precipMax = { v: it.precip_mm, t: it.time };
 	}
-	return { gustMax, precipMax };
+	return { windMax, gustMax, precipMax };
 }
 
 export async function buildReport(input: {
@@ -112,7 +117,7 @@ export async function buildReport(input: {
 	series: SeriesItem[];
 	warnings: WarningItem[];
 	sources_links: SourcesLinks;
-	mode?: Mode; // 'daily' (default quando vier daily do UI) ou 'hourly'
+	mode?: Mode; // 'daily' | 'hourly'
 }): Promise<{ blob: Blob; arrayBuffer: ArrayBuffer; document: Document }> {
 	const { local, period, series, warnings, sources_links } = input;
 	const mode: Mode = input.mode ?? 'hourly';
@@ -121,7 +126,7 @@ export async function buildReport(input: {
 	const subtitle = local.label ? `${local.label} (${local.lat.toFixed(3)}, ${local.lon.toFixed(3)})` : `${local.lat.toFixed(3)}, ${local.lon.toFixed(3)}`;
 	const rangeStr = `${period.startISO} — ${period.endISO}`;
 
-	const { gustMax, precipMax } = extremes(series);
+	const { windMax, gustMax, precipMax } = extremes(series);
 
 	const doc = new Document({
 		sections: [{
@@ -135,13 +140,14 @@ export async function buildReport(input: {
 				new Paragraph({
 					children: [
 						bold('Enquadramento: '),
-						new TextRun(`Análise ${mode === 'daily' ? 'diária' : 'horária'} do vento a 10 m, rajada e precipitação, no período indicado (fuso ${period.tz}). `),
-						new TextRun('Os dados base são horários; quando selecionado "Daily", os valores são agregados por dia (média do vento, rajada máxima diária e precipitação máxima horária por dia).')
+						new TextRun(`Análise ${mode === 'daily' ? 'diária' : 'horária'} do vento a 10 m, rajada e precipitação no período indicado (fuso ${period.tz}). `),
+						new TextRun('Quando selecionado "Daily", os valores por dia correspondem aos picos desse dia: vento máximo, rajada máxima e precipitação máxima horária.')
 					]
 				}),
 				new Paragraph({
 					children: [
 						bold('Extremos no intervalo: '),
+						new TextRun(`${windMax ? `vento máximo ${windMax.v.toFixed(1)} km/h em ${windMax.t}` : '—'}; `),
 						new TextRun(`${gustMax ? `rajada máxima ${gustMax.v.toFixed(1)} km/h em ${gustMax.t}` : '—'}; `),
 						new TextRun(`${precipMax ? `precipitação máxima horária ${precipMax.v.toFixed(1)} mm em ${precipMax.t}` : '—'}.`)
 					]
@@ -149,18 +155,18 @@ export async function buildReport(input: {
 				new Paragraph({
 					children: [
 						bold('Qualidade de dados: '),
-						new TextRun('Quando faltaram observações locais, a série foi complementada com reanálises/arquivos históricos. Valores extremos podem refletir picos muito localizados. ')
+						new TextRun('Quando faltaram observações locais, a série foi complementada com reanálises/arquivos históricos. Picos anómalos podem refletir condições muito localizadas ou lacunas na observação.')
 					]
 				}),
 				new Paragraph({
 					children: [
 						bold('Utilização: '),
-						new TextRun('Este relatório destina-se a suporte operacional e auditoria; copiar e colar os links listados abaixo diretamente no browser para consulta das fontes.')
+						new TextRun('Este relatório destina-se a suporte operacional e auditoria; copie e cole os links listados abaixo diretamente no browser para consulta das fontes.')
 					]
 				}),
 				para(''),
 
-				new Paragraph({ text: `Tabela ${mode === 'daily' ? 'Diária' : 'Horária'}`, heading: HeadingLevel.HEADING_2 }),
+				new Paragraph({ text: `Tabela ${mode === 'daily' ? 'Diária (picos por dia)' : 'Horária'}`, heading: HeadingLevel.HEADING_2 }),
 				mode === 'daily' ? buildDailyTable(series) : buildHourlyTable(series),
 
 				para(''),
